@@ -9166,6 +9166,103 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+struct test_flash_attn_ext_kv_compress : public test_flash_attn_ext {
+    const int pattern;
+    const bool update;
+    const ggml_type index_type;
+    std::vector<ggml_tensor *> outputs;
+
+    test_flash_attn_ext_kv_compress(int64_t hs, int64_t nh, int64_t gqa, int64_t kv,
+                                  int pattern = 0, bool update = false, ggml_type index_type = GGML_TYPE_I64)
+        : test_flash_attn_ext(hs, hs, nh, {gqa, 1}, kv, 1), pattern(pattern), update(update), index_type(index_type) {}
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",kv_compress=1," + VARS_TO_STR3(pattern, update, index_type);
+    }
+
+    std::string op_desc(ggml_tensor *) override { return "FLASH_ATTN_EXT(kv_compress)"; }
+    bool run_whole_graph() override { return update; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return update ? outputs : std::vector<ggml_tensor *>{}; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hsk, 1, nh*nr23[0]);
+        ggml_set_name(q, "q");
+        ggml_tensor * k = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hsk*nh, kv);
+        ggml_set_name(k, "k_cache");
+        ggml_tensor * v = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hsv*nh, kv);
+        ggml_set_name(v, "v_cache");
+        ggml_tensor * m = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kv, 1);
+        ggml_set_name(m, "m");
+
+        auto attention = [&](ggml_tensor * keys) {
+            keys = ggml_view_3d(ctx, keys, hsk, kv, nh, keys->nb[1], hsk*sizeof(ggml_fp16_t), 0);
+            ggml_tensor * values = ggml_view_3d(ctx, v, hsv, kv, nh, v->nb[1], hsv*sizeof(ggml_fp16_t), 0);
+            ggml_tensor * out = ggml_flash_attn_ext(ctx, q, keys, values, m, 1.0f/sqrtf(hsk), 0.0f, 0.0f);
+            ggml_prec_set_acc(out, GGML_PREC_F32);
+            return out;
+        };
+
+        ggml_tensor * before = attention(k);
+        ggml_set_name(before, "before");
+        outputs = {before};
+        if (!update) {
+            return before;
+        }
+
+        ggml_build_forward_expand(gf, before);
+        ggml_tensor * rows = ggml_new_tensor_1d(ctx, index_type, 2);
+        ggml_set_name(rows, "rows");
+        ggml_tensor * patch = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hsk*nh, 2);
+        ggml_set_name(patch, "patch");
+        ggml_tensor * changed = ggml_set_rows(ctx, k, patch, rows);
+        ggml_build_forward_expand(gf, changed);
+        ggml_tensor * after = attention(changed);
+        ggml_set_name(after, "after");
+        outputs.push_back(after);
+        return after;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        static constexpr ggml_fp16_t values[] = {
+            0x0000, 0x8000, 0x0001, 0x8001, 0x3C00, 0xBC00, 0x3800, 0xB800,
+            0x4000, 0xC000, 0x7BFF, 0xFBFF, 0x0400, 0x8400, 0x3555, 0xB555,
+        };
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src || t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (strcmp(t->name, "k_cache") == 0) {
+                std::vector<ggml_fp16_t> data(ggml_nelements(t));
+                for (int64_t i = 0; i < ggml_nelements(t); ++i) {
+                    const int64_t row = i / (hsk*nh), head = i / hsk % nh, axis = i % hsk;
+                    const int64_t index = pattern == 2 ? row/std::min<int64_t>(16, 4096/hsk) + 5*head : axis + 3*row + 5*head;
+                    data[i] = pattern == 1 ? ggml_fp16_t(0x3000 + (row*hsk + axis + 17*head) % 4096) : values[index % 16];
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "q") == 0 || strcmp(t->name, "patch") == 0) {
+                std::vector<float> data(ggml_nelements(t));
+                for (int64_t i = 0; i < ggml_nelements(t); ++i) {
+                    data[i] = strcmp(t->name, "q") == 0 ? float((5*i + i/hsk) % 17 - 8) / 65536.0f
+                        : ggml_fp16_to_fp32(values[(i % hsk + i/hsk % nh + 5*(i/(hsk*nh)) + 3) % 16]);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "rows") == 0) {
+                std::array<int64_t, 2> rows = {5, kv - 2};
+                std::array<int32_t, 2> rows32 = {5, int32_t(kv - 2)};
+                ggml_backend_tensor_set(t, index_type == GGML_TYPE_I64 ? (void *) rows.data() : (void *) rows32.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "m") == 0) {
+                std::vector<ggml_fp16_t> data(kv);
+                for (int64_t i = 0; i < kv; ++i) {
+                    data[i] = ggml_fp32_to_fp16(i % 11 == 0 ? -INFINITY : 0.125f*float(i % 9 - 4));
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // large Q values, so the online softmax has to rescale the partial results
 struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     static constexpr int q_range = 20;
@@ -13028,6 +13125,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {11, 22, 33, 44}, 0, 2, 0, 4, 0, 6, 0, 8, tfrm, circular));
         }
     }
+
+    test_cases.emplace_back(new test_flash_attn_ext_kv_compress(128, 1, 1,   47));
+    test_cases.emplace_back(new test_flash_attn_ext_kv_compress(256, 4, 4,   65));
+    test_cases.emplace_back(new test_flash_attn_ext_kv_compress(512, 2, 2,   17));
+    test_cases.emplace_back(new test_flash_attn_ext_kv_compress(128, 2, 4, 1025));
+    test_cases.emplace_back(new test_flash_attn_ext_kv_compress(256, 2, 4,   65, 1));
+    test_cases.emplace_back(new test_flash_attn_ext_kv_compress(256, 2, 4,  256, 2));
+    test_cases.emplace_back(new test_flash_attn_ext_kv_compress(256, 2, 4,   65, 0, true, GGML_TYPE_I32));
+    test_cases.emplace_back(new test_flash_attn_ext_kv_compress(256, 2, 4,   65, 0, true, GGML_TYPE_I64));
+    test_cases.emplace_back(new test_flash_attn_ext_kv_compress(512, 2, 2,   17, 0, true, GGML_TYPE_I64));
 
     // prefill-shaped cases with long KV (nb >= 32, kv >= 1024): covers the
     // XMX/GEMM-accelerated SYCL FA path which only activates for these shapes.

@@ -130,7 +130,16 @@ layout (binding = 2) readonly buffer V16V4 {FLOAT_TYPEV4 data_v16v4[];};
 // K/V/mask offsets in 16-bit elements for the current head/batch, set in main().
 uint32_t g_k_off_elem, g_v_off_elem, g_m_off_elem;
 
+#if !defined(BFLOAT16)
+#include "fa_kv_decode.glsl"
+#endif
+
 FLOAT_TYPE faGatherK(const decodeBufFA_K bl_in, const uint32_t blockCoords[2], const uint32_t coordInBlock[2]) {
+#if !defined(BFLOAT16)
+    if (USE_KV_COMPRESS) {
+        return fa_kv_decode_k(blockCoords[0], blockCoords[1] * FA_GATHER_BS + coordInBlock[1]);
+    }
+#endif
     if (blockCoords[0] >= p.split_kv) { return FLOAT_TYPE(0.0); }
     const int r = data_sparse[sparse_base + blockCoords[0]];
     if (r < 0) { return FLOAT_TYPE(0.0); }
@@ -158,6 +167,13 @@ FLOAT_TYPE faGatherV(const decodeBufFA_V bl_in, const uint32_t blockCoords[2], c
 
 #ifdef GL_NV_cooperative_matrix_decode_vector
 FLOAT_TYPEV4 faGatherKVector(const decodeBufFA_K bl_in, const uint32_t blockCoords[2], const uint32_t coordInBlock[2]) {
+#if !defined(BFLOAT16)
+    if (USE_KV_COMPRESS) {
+        const uint32_t row = blockCoords[0];
+        const uint32_t axis = blockCoords[1] * FA_GATHER_BS + coordInBlock[1];
+        return f16vec4(fa_kv_decode_k(row, axis), fa_kv_decode_k(row, axis + 1u), fa_kv_decode_k(row, axis + 2u), fa_kv_decode_k(row, axis + 3u));
+    }
+#endif
     if (blockCoords[0] >= p.split_kv) { return FLOAT_TYPEV4(0.0); }
     const int r = data_sparse[sparse_base + blockCoords[0]];
     if (r < 0) { return FLOAT_TYPEV4(0.0); }
@@ -413,8 +429,14 @@ void main() {
         coopmat<FLOAT_TYPE, gl_ScopeWorkgroup, HSK_pad, Bc, gl_MatrixUseB> K_T;
 
         uint32_t k_offset = ik2*p.nb12 + ik3*p.nb13;
+        bool gather_k = USE_SPARSE;
+#if !defined(BFLOAT16)
+        if (USE_KV_COMPRESS) {
+            gather_k = gather_k || fa_kv_block_encoded(j * Bc, min(KV, (j + 1u) * Bc));
+        }
+#endif
         // F16: bs_k==1 (direct load). F32: bs_k==4 (vec4 / dequantFuncF32). Quantized types: bs_k==32.
-        if (USE_SPARSE) {
+        if (gather_k) {
             coopMatLoadTensorNV(K_T, data_k, k_offset, sliceTensorLayoutNV(tensorLayoutK, j * Bc, Bc, 0, HSK_pad), tensorViewTranspose FAGATHERK);
 #if !defined(BFLOAT16)
         } else if (USE_DECODE_K) {

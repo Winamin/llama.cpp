@@ -1,0 +1,151 @@
+#version 460
+
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer K {uint16_t data_k[];};
+layout(binding = 1) buffer C {uint data_c[];};
+layout(binding = 2) readonly buffer G {uint data_g[];};
+layout(binding = 3) uniform accelerationStructureEXT kv_as;
+
+layout(push_constant) uniform parameter {
+    uint rows;
+    uint head_width;
+    uint heads;
+    uint k_row_stride16;
+    uint k_head_stride16;
+    uint tile_rows;
+    uint tiles_per_head;
+    uint tile_words;
+} p;
+
+const uint MAX_VALUES = 4096;
+shared uint nodes[MAX_VALUES];
+shared uint ranks[MAX_VALUES];
+shared uint buckets[256];
+shared uint unique_count;
+
+uint value_bucket(uint bits) {
+    return (bits ^ (bits >> 8)) & 255u;
+}
+
+void main() {
+    const uint tile = gl_WorkGroupID.x;
+    const uint head = gl_WorkGroupID.y;
+    const uint lane = gl_LocalInvocationIndex;
+    const uint first_row = tile * p.tile_rows;
+    if (head >= p.heads || first_row >= p.rows) {
+        return;
+    }
+    const uint values = min(p.tile_rows, p.rows - first_row) * p.head_width;
+    const uint base = 4u + (head * p.tiles_per_head + tile) * p.tile_words;
+    const uint generation = data_g[2u + tile];
+    if (data_c[base + 1u] == generation) {
+        return;
+    }
+
+    for (uint bucket = lane; bucket < 256u; bucket += gl_WorkGroupSize.x) {
+        buckets[bucket] = 0;
+    }
+    if (lane == 0) {
+        unique_count = 0;
+    }
+    barrier();
+    for (uint index = lane; index < values; index += gl_WorkGroupSize.x) {
+        const uint row = first_row + index / p.head_width;
+        const uint axis = index % p.head_width;
+        const uint bits = uint(data_k[head * p.k_head_stride16 + row * p.k_row_stride16 + axis]);
+        const uint next = atomicExchange(buckets[value_bucket(bits)], index + 1u);
+        nodes[index] = bits | (next << 16);
+    }
+    barrier();
+
+    for (uint bucket = lane; bucket < 256u; bucket += gl_WorkGroupSize.x) {
+        uint member = buckets[bucket];
+        if (member == 0) {
+            continue;
+        }
+        bool found = false;
+        rayQueryEXT query;
+        rayQueryInitializeEXT(query, kv_as, gl_RayFlagsNoOpaqueEXT, 255u,
+                              vec3(float(bucket), 0.0, -0.5), 0.01, vec3(0.0, 0.0, 1.0), 1.0);
+        while (rayQueryProceedEXT(query)) {
+            if (rayQueryGetIntersectionTypeEXT(query, false) != gl_RayQueryCandidateIntersectionAABBEXT ||
+                rayQueryGetIntersectionPrimitiveIndexEXT(query, false) != bucket) {
+                continue;
+            }
+            found = true;
+            break;
+        }
+        if (!found) {
+            atomicOr(unique_count, 0x80000000u);
+            continue;
+        }
+        uint roots = 0;
+        while (member != 0) {
+            const uint index = member - 1u;
+            const uint node = nodes[index];
+            const uint next = node >> 16;
+            const uint bits = node & 65535u;
+            uint root = roots;
+            while (root != 0) {
+                const uint candidate = root - 1u;
+                if ((nodes[candidate] & 65535u) == bits) {
+                    ranks[index] = ranks[candidate] & 0x7fffffffu;
+                    break;
+                }
+                root = nodes[candidate] >> 16;
+            }
+            if (root == 0) {
+                ranks[index] = atomicAdd(unique_count, 1u) | 0x80000000u;
+                nodes[index] = bits | (roots << 16);
+                roots = member;
+            }
+            member = next;
+        }
+    }
+    barrier();
+
+    const uint count = unique_count & 0x7fffffffu;
+    const uint bits = count > 1u ? uint(findMSB(count - 1u) + 1) : 0u;
+    const uint dictionary_words = (count + 1u) / 2u;
+    const uint index_words = (values * bits + 31u) / 32u;
+    if ((unique_count & 0x80000000u) != 0 || (2u + dictionary_words + index_words) * 4u >= values * 2u) {
+        if (lane == 0) {
+            data_c[base] = 0;
+            data_c[base + 1u] = generation;
+        }
+        return;
+    }
+
+    for (uint word = lane; word < dictionary_words + index_words; word += gl_WorkGroupSize.x) {
+        data_c[base + 2u + word] = 0;
+    }
+    memoryBarrierBuffer();
+    barrier();
+    for (uint index = lane; index < values; index += gl_WorkGroupSize.x) {
+        const uint rank = ranks[index] & 0x7fffffffu;
+        if ((ranks[index] & 0x80000000u) != 0) {
+            atomicOr(data_c[base + 2u + rank / 2u], (nodes[index] & 65535u) << ((rank & 1u) * 16u));
+        }
+        if (bits != 0) {
+            const uint bit = index * bits;
+            const uint word = base + 2u + dictionary_words + bit / 32u;
+            const uint shift = bit & 31u;
+            atomicOr(data_c[word], rank << shift);
+            if (shift + bits > 32u) {
+                atomicOr(data_c[word + 1u], rank >> (32u - shift));
+            }
+        }
+    }
+    memoryBarrierBuffer();
+    barrier();
+    if (lane == 0) {
+        data_c[base] = (count << 8) | bits;
+        data_c[base + 1u] = generation;
+        atomicAdd(data_c[3], 1u);
+    }
+}
